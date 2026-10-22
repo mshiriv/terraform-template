@@ -1,0 +1,51 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraform.tfstate.lock.info
+.terraformrc
+terraform.rc
+# Lockfiles are not committed yet: see "Known gaps" in CLAUDE.md before removing
+# this line (a single-platform lock breaks CI on the other platform).
+.terraform.lock.hcl
+
+# CI scratch output written inside a root by the plan/apply/drift jobs
+plan.txt
+apply.txt
+.tf-plugin-cache/
+
+# Secrets: never commit tfvars that carry sensitive values. Committed
+# terraform.tfvars files hold non-secret, environment-specific values only.
+# Uncomment if you keep local secret var files:
+# *.auto.tfvars
+# secrets.tfvars
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.envrc
+
+# Claude Code: per-developer overrides (the committed .claude/settings.json is shared)
+.claude/settings.local.json
+
+# Private keys: never commit
+*.pem
+*.key

@@ -1,0 +1,86 @@
+repos:
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: 80c8033123f6d6b9ccd1a9458562ea4180742af7 # frozen: v1.109.2
+    hooks:
+      - id: terraform_fmt
+      - id: terraform_validate
+        args:
+          - --hook-config=--retry-once-with-cleanup=true
+      - id: terraform_tflint
+        args:
+          - --args=--config=__GIT_WORKING_DIR__/.tflint.hcl
+      - id: terraform_docs
+        args:
+          - --args=--config=.terraform-docs.yml
+      - id: terraform_checkov
+        args:
+          - --args=--quiet
+          - --args=--framework=terraform
+          # Skipped checks. Every entry needs a reason here; prefer an inline
+          # `#checkov:skip=<ID>:<reason>` on the one resource instead.
+          #
+          # CKV_TF_1 - "module sources must pin a commit hash". Registry and git
+          #            modules are pinned by semver (`~>` ranges / ?ref=<tag>).
+          #            Tracked as the "~> module ranges" gap in CLAUDE.md.
+          - --args=--skip-check=CKV_TF_1
+      - id: terraform_trivy
+        args:
+          - --args=--severity=HIGH,CRITICAL
+          - --args=--skip-check-update
+          # Skip example manifests inside downloaded modules (they're docs, not
+          # deployed). Skipping the whole .terraform tree triggers a git error
+          # on the runner when trivy re-downloads modules, so keep .terraform
+          # reachable and exclude only the example dirs.
+          - --args=--skip-dirs=**/examples
+          - --args=--ignorefile=__GIT_WORKING_DIR__/.trivyignore
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # frozen: v6.0.0
+    hooks:
+      - id: check-merge-conflict
+      # Keep vendored third-party content (the terraform-skill) byte-identical to
+      # its upstream release; do not let the whitespace normalizers rewrite it.
+      - id: end-of-file-fixer
+        exclude: ^\.claude/skills/terraform-skill/
+      - id: trailing-whitespace
+        exclude: ^\.claude/skills/terraform-skill/
+      - id: check-yaml
+      - id: check-json
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+      - id: detect-private-key
+      - id: no-commit-to-branch
+        args: [--branch, main]
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e # frozen: v8.30.1
+    hooks:
+      # Content-aware secret scanning. Complements detect-private-key (which only
+      # catches PEM-armored keys) with entropy/token/credential detection.
+      # Excludes the vendored terraform-skill tree (kept byte-identical to upstream).
+      - id: gitleaks
+        exclude: ^\.claude/skills/terraform-skill/
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: 745eface02aef23e168a8afb6b5737818efbea95 # frozen: v0.11.0.1
+    hooks:
+      - id: shellcheck
+
+  - repo: https://github.com/rhysd/actionlint
+    rev: 914e7df21a07ef503a81201c76d2b11c789d3fca # frozen: v1.7.12
+    hooks:
+      # Lints .github/workflows/*.yml: expression syntax, job/step references,
+      # and (via shellcheck on PATH) the bash in every `run:` block.
+      - id: actionlint
+
+  - repo: local
+    hooks:
+      # tflint/checkov inspect resource-level HCL and never see provider
+      # default_tags, so the tag taxonomy is validated directly. Scans every
+      # aws/**/providers.tf regardless of which files changed.
+      - id: check-required-tags
+        name: Required default_tags on every AWS provider
+        entry: scripts/check-required-tags.sh
+        language: script
+        pass_filenames: false
+        files: (^aws/.*providers\.tf|^scripts/check-required-tags\.sh)$

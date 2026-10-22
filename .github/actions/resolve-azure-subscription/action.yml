@@ -1,0 +1,69 @@
+name: Resolve Azure subscription
+description: >-
+  Map a Terraform root directory (azure/<env>/...) to the Azure subscription and
+  GitHub Environment to use, and export ARM_SUBSCRIPTION_ID for the azurerm
+  provider so no subscription IDs live in code. The directory is read from env
+  (never interpolated into the shell) to close the script-injection vector.
+
+inputs:
+  directory:
+    description: Terraform root directory.
+    required: true
+  client-id:
+    description: CI app (client) ID (the AZURE_CLIENT_ID secret, from azure/bootstrap).
+    required: true
+  tenant-id:
+    description: Entra tenant ID (the AZURE_TENANT_ID secret).
+    required: true
+  subscription-production:
+    description: Subscription ID for azure/production/** roots.
+    required: true
+  subscription-staging:
+    description: Subscription ID for azure/staging/** roots.
+    required: true
+
+outputs:
+  client-id:
+    description: The Azure client ID to log in with.
+    value: ${{ steps.resolve.outputs.client_id }}
+  tenant-id:
+    description: The Azure tenant ID.
+    value: ${{ steps.resolve.outputs.tenant_id }}
+  subscription-id:
+    description: The resolved subscription ID.
+    value: ${{ steps.resolve.outputs.subscription_id }}
+  environment:
+    description: The resolved environment name (production|staging), also the GitHub Environment for applies.
+    value: ${{ steps.resolve.outputs.environment }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve Azure subscription
+      id: resolve
+      shell: bash
+      env:
+        DIR: ${{ inputs.directory }}
+        CLIENT_ID: ${{ inputs.client-id }}
+        TENANT_ID: ${{ inputs.tenant-id }}
+        SUBSCRIPTION_PRODUCTION: ${{ inputs.subscription-production }}
+        SUBSCRIPTION_STAGING: ${{ inputs.subscription-staging }}
+      run: |
+        case "$DIR" in
+          azure/production/*) env=production; sub="$SUBSCRIPTION_PRODUCTION" ;;
+          azure/staging/*) env=staging; sub="$SUBSCRIPTION_STAGING" ;;
+          *)
+            echo "::error::No Azure subscription mapping for '$DIR' (expected azure/<production|staging>/...). Extend .github/actions/resolve-azure-subscription."
+            exit 1
+            ;;
+        esac
+        {
+          echo "client_id=$CLIENT_ID"
+          echo "tenant_id=$TENANT_ID"
+          echo "subscription_id=$sub"
+          echo "environment=$env"
+        } >> "$GITHUB_OUTPUT"
+        # azurerm requires a subscription; roots don't hardcode one. Auth itself
+        # rides the CLI session azure/login (OIDC) creates, so don't export
+        # ARM_CLIENT_ID here: it would steer the provider away from CLI auth.
+        echo "ARM_SUBSCRIPTION_ID=$sub" >> "$GITHUB_ENV"

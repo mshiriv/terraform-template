@@ -1,0 +1,35 @@
+version: 2
+
+updates:
+  # Keep the SHA-pinned GitHub Actions current via reviewable PRs. Covers both
+  # the workflows (directory "/") and the local composite actions.
+  - package-ecosystem: github-actions
+    directories:
+      - "/"
+      - "/.github/actions/*"
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+      - github-actions
+
+  # The pip-pinned CI tooling in .github/requirements-precommit.txt (pre-commit,
+  # checkov). NB: tflint/trivy/terraform-docs are pinned as input defaults in
+  # .github/actions/install-precommit-tools/action.yml and the pre-commit hook
+  # `rev`s are SHA-frozen in .pre-commit-config.yaml — neither is covered by a
+  # Dependabot ecosystem, so those remain manual bumps.
+  - package-ecosystem: pip
+    directory: "/.github"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+      - python

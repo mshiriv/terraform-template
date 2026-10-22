@@ -1,0 +1,58 @@
+name: Resolve AWS role
+description: >-
+  Map a Terraform root directory to the AWS role ARN and environment name to
+  assume. The one place the dir→account mapping lives, shared by the
+  plan, drift, and chatops workflows. The directory is read from env (never
+  interpolated into the shell) to close the script-injection vector.
+
+inputs:
+  directory:
+    description: Terraform root directory.
+    required: true
+  role-production:
+    description: AWS role ARN for the production account.
+    required: true
+  role-staging:
+    description: AWS role ARN for the staging account.
+    required: true
+  role-sandbox:
+    description: AWS role ARN for the sandbox account.
+    required: true
+  role-management:
+    description: AWS role ARN for the management account (default fallback).
+    required: true
+
+outputs:
+  role-arn:
+    description: The resolved role ARN to assume.
+    value: ${{ steps.resolve.outputs.role_arn }}
+  env:
+    description: The resolved environment name (production|staging|sandbox|management).
+    value: ${{ steps.resolve.outputs.env }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve AWS role
+      id: resolve
+      shell: bash
+      env:
+        DIR: ${{ inputs.directory }}
+        ROLE_PRODUCTION: ${{ inputs.role-production }}
+        ROLE_STAGING: ${{ inputs.role-staging }}
+        ROLE_SANDBOX: ${{ inputs.role-sandbox }}
+        ROLE_MANAGEMENT: ${{ inputs.role-management }}
+      run: |
+        if [[ "$DIR" == aws/accounts/production/* ]]; then
+          echo "role_arn=$ROLE_PRODUCTION" >> "$GITHUB_OUTPUT"
+          echo "env=production" >> "$GITHUB_OUTPUT"
+        elif [[ "$DIR" == aws/accounts/staging/* ]]; then
+          echo "role_arn=$ROLE_STAGING" >> "$GITHUB_OUTPUT"
+          echo "env=staging" >> "$GITHUB_OUTPUT"
+        elif [[ "$DIR" == aws/accounts/sandbox/* ]]; then
+          echo "role_arn=$ROLE_SANDBOX" >> "$GITHUB_OUTPUT"
+          echo "env=sandbox" >> "$GITHUB_OUTPUT"
+        else
+          echo "role_arn=$ROLE_MANAGEMENT" >> "$GITHUB_OUTPUT"
+          echo "env=management" >> "$GITHUB_OUTPUT"
+        fi

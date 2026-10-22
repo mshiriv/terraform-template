@@ -1,0 +1,24 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyCreateWithoutProductTag",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:RunInstances",
+        "ec2:CreateVolume",
+        "rds:CreateDBInstance",
+        "rds:CreateDBCluster",
+        "ecr:CreateRepository",
+        "elasticache:CreateReplicationGroup",
+        "elasticache:CreateCacheCluster"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/Product": "true"
+        }
+      }
+    }
+  ]
+}

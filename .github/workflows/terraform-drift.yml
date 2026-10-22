@@ -1,0 +1,430 @@
+name: Terraform Drift Detection
+
+on:
+  schedule:
+    - cron: "0 6 * * 1-5" # Weekdays at 06:00 UTC
+  workflow_dispatch: {}
+
+# Queue a second sweep behind the first (e.g. a manual dispatch overlapping the
+# cron run) rather than fanning out a duplicate discover + matrix. Per-root state
+# safety is still handled by the per-leg `terraform-<cloud>-<dir>` groups below.
+concurrency:
+  group: terraform-drift
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Keep in sync with .terraform-version.
+  TF_VERSION: "1.16.6"
+  TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.tf-plugin-cache
+  # See terraform-plan.yml: lets the shared plugin cache coexist with the
+  # gitignored-lockfile policy instead of failing init on a checksum mismatch.
+  TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE: "1"
+
+jobs:
+  # -------------------------------------------------------------------
+  # Job 1: Discover every Terraform root (dynamic — no hand-maintained list).
+  # Uses the same CI-plannable filter as PR plans (scripts/detect-changes.sh),
+  # so roots CI cannot reach (bootstrap, github/*, .ci-skip roots) are excluded
+  # in exactly one place. Clouds whose CI_<CLOUD>_ENABLED variable isn't "true"
+  # are skipped.
+  # -------------------------------------------------------------------
+  discover:
+    name: Discover roots
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      aws_dirs: ${{ steps.split.outputs.aws_dirs }}
+      azure_dirs: ${{ steps.split.outputs.azure_dirs }}
+      datadog_dirs: ${{ steps.split.outputs.datadog_dirs }}
+      has_aws: ${{ steps.split.outputs.has_aws }}
+      has_azure: ${{ steps.split.outputs.has_azure }}
+      has_datadog: ${{ steps.split.outputs.has_datadog }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Discover Terraform roots
+        id: discover
+        run: |
+          dirs=$(scripts/detect-changes.sh --all)
+          echo "dirs=$dirs" >> "$GITHUB_OUTPUT"
+
+      - name: Split by cloud
+        id: split
+        uses: ./.github/actions/split-roots
+        with:
+          dirs: ${{ steps.discover.outputs.dirs }}
+          aws-enabled: ${{ vars.CI_AWS_ENABLED }}
+          azure-enabled: ${{ vars.CI_AZURE_ENABLED }}
+          datadog-enabled: ${{ vars.CI_DATADOG_ENABLED }}
+
+  # -------------------------------------------------------------------
+  # Job 2: Drift — AWS
+  # -------------------------------------------------------------------
+  drift-aws:
+    name: "Drift: ${{ matrix.directory }}"
+    needs: discover
+    if: needs.discover.outputs.has_aws == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Serialize with chatops apply on the same root (shared state lock).
+    concurrency:
+      group: terraform-aws-${{ matrix.directory }}
+      cancel-in-progress: false
+    strategy:
+      matrix:
+        directory: ${{ fromJson(needs.discover.outputs.aws_dirs) }}
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Resolve AWS role
+        id: account
+        uses: ./.github/actions/resolve-aws-role
+        with:
+          directory: ${{ matrix.directory }}
+          role-production: ${{ secrets.AWS_ROLE_PRODUCTION }}
+          role-staging: ${{ secrets.AWS_ROLE_STAGING }}
+          role-sandbox: ${{ secrets.AWS_ROLE_SANDBOX }}
+          role-management: ${{ secrets.AWS_ROLE_MANAGEMENT }}
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.account.outputs.role-arn }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Configure private module access
+        uses: ./.github/actions/tf-modules-token
+        with:
+          app-id: ${{ secrets.TF_MODULES_APP_ID }}
+          private-key: ${{ secrets.TF_MODULES_APP_PRIVATE_KEY }}
+          owner: ${{ vars.TF_MODULES_OWNER }}
+          repositories: ${{ vars.TF_MODULES_REPOS || 'terraform-modules' }}
+
+      # Exact key per root, no restore-keys fallback (see terraform-plan.yml).
+      - name: Cache provider plugins
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: tf-plugins-v2-${{ runner.os }}-${{ hashFiles(format('{0}/providers.tf', matrix.directory)) }}
+
+      - name: Terraform Init
+        working-directory: ${{ matrix.directory }}
+        run: |
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          terraform init -input=false
+
+      - name: Terraform Plan (drift check)
+        working-directory: ${{ matrix.directory }}
+        id: plan
+        run: |
+          # Disable errexit so the non-zero -detailed-exitcode doesn't abort the
+          # script before we can capture it; PIPESTATUS[0] is terraform's own code.
+          # -out=tfplan lets the next step inspect the machine-readable plan.
+          # -lock=false: this plan is read-only (never applied), so it takes no
+          # state lock. A locked plan that is cancelled or times out strands its
+          # lockfile in the backend, and that blocks the next apply until someone
+          # force-unlocks it (docs/runbooks/state-lock-recovery.md).
+          set +e
+          terraform plan -no-color -input=false -lock=false -detailed-exitcode -out=tfplan 2>&1 | tee plan.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      # Exit code 2 only means "non-empty plan" — it also fires for output-only
+      # and refresh-only diffs that change no infrastructure. Classify the saved
+      # plan so those benign cases don't masquerade as drift.
+      - name: Classify drift
+        id: classify
+        if: steps.plan.outputs.exitcode == '2'
+        uses: ./.github/actions/tf-drift-classify
+        with:
+          directory: ${{ matrix.directory }}
+
+      - name: Open issue on drift
+        if: steps.classify.outputs.real_drift == 'true'
+        # Issue bookkeeping is a best-effort notification layer — a flaky GitHub
+        # API call must not red the read-only drift check (it retries internally
+        # and the next scheduled run is idempotent).
+        continue-on-error: true
+        uses: ./.github/actions/post-tf-comment
+        with:
+          directory: ${{ matrix.directory }}
+          kind: drift
+          label: ${{ steps.account.outputs.env }}
+          outcome: failure
+          file-name: plan.txt
+          fingerprint: ${{ steps.classify.outputs.fingerprint }}
+          github-token: ${{ github.token }}
+
+      # Clean (exit 0) or benign-only (exit 2 but no real drift): close any open
+      # drift issue for this root so resolved/false-positive issues don't linger.
+      - name: Resolve drift issue
+        if: steps.plan.outputs.exitcode != '1' && steps.classify.outputs.real_drift != 'true'
+        continue-on-error: true
+        uses: ./.github/actions/post-tf-comment
+        with:
+          directory: ${{ matrix.directory }}
+          kind: drift-resolved
+          label: ${{ steps.account.outputs.env }}
+          github-token: ${{ github.token }}
+
+      # A check that cannot run (auth, init or plan error) is not drift-free.
+      # A red scheduled run is easy to miss for months, so track errors as
+      # issues, like drift.
+      - name: Open issue on drift-check error
+        if: failure() || steps.plan.outputs.exitcode == '1'
+        continue-on-error: true
+        uses: ./.github/actions/post-tf-comment
+        with:
+          directory: ${{ matrix.directory }}
+          kind: drift-error
+          label: ${{ steps.account.outputs.env }}
+          outcome: failure
+          file-name: plan.txt
+          github-token: ${{ github.token }}
+
+      # Exit code 1 = plan/init errored — surface as a red run, not a silent pass.
+      - name: Fail on drift-check error
+        if: steps.plan.outputs.exitcode == '1'
+        env:
+          DIR: ${{ matrix.directory }}
+        run: |
+          echo "::error::Drift check errored for ${DIR} (terraform plan exit 1)"
+          exit 1
+
+  # -------------------------------------------------------------------
+  # Job 3: Drift — Azure
+  # -------------------------------------------------------------------
+  drift-azure:
+    name: "Drift: ${{ matrix.directory }}"
+    needs: discover
+    if: needs.discover.outputs.has_azure == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: terraform-azure-${{ matrix.directory }}
+      cancel-in-progress: false
+    strategy:
+      matrix:
+        directory: ${{ fromJson(needs.discover.outputs.azure_dirs) }}
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Resolve Azure subscription
+        id: azure
+        uses: ./.github/actions/resolve-azure-subscription
+        with:
+          directory: ${{ matrix.directory }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-production: ${{ secrets.AZURE_SUBSCRIPTION_PRODUCTION }}
+          subscription-staging: ${{ secrets.AZURE_SUBSCRIPTION_STAGING }}
+
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ steps.azure.outputs.client-id }}
+          tenant-id: ${{ steps.azure.outputs.tenant-id }}
+          subscription-id: ${{ steps.azure.outputs.subscription-id }}
+
+      - name: Configure private module access
+        uses: ./.github/actions/tf-modules-token
+        with:
+          app-id: ${{ secrets.TF_MODULES_APP_ID }}
+          private-key: ${{ secrets.TF_MODULES_APP_PRIVATE_KEY }}
+          owner: ${{ vars.TF_MODULES_OWNER }}
+          repositories: ${{ vars.TF_MODULES_REPOS || 'terraform-modules' }}
+
+      - name: Terraform Init
+        working-directory: ${{ matrix.directory }}
+        run: |
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          terraform init -input=false
+
+      - name: Terraform Plan (drift check)
+        working-directory: ${{ matrix.directory }}
+        id: plan
+        run: |
+          set +e
+          terraform plan -no-color -input=false -lock=false -detailed-exitcode -out=tfplan 2>&1 | tee plan.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Classify drift
+        id: classify
+        if: steps.plan.outputs.exitcode == '2'
+        uses: ./.github/actions/tf-drift-classify
+        with:
+          directory: ${{ matrix.directory }}
+
+      - name: Open issue on drift
+        if: steps.classify.outputs.real_drift == 'true'
+        # Issue bookkeeping is a best-effort notification layer — a flaky GitHub
+        # API call must not red the read-only drift check (it retries internally
+        # and the next scheduled run is idempotent).
+        continue-on-error: true
+        uses: ./.github/actions/post-tf-comment
+        with:
+          directory: ${{ matrix.directory }}
+          kind: drift
+          label: Azure ${{ steps.azure.outputs.environment }}
+          outcome: failure
+          file-name: plan.txt
+          fingerprint: ${{ steps.classify.outputs.fingerprint }}
+          github-token: ${{ github.token }}
+
+      - name: Resolve drift issue
+        if: steps.plan.outputs.exitcode != '1' && steps.classify.outputs.real_drift != 'true'
+        continue-on-error: true
+        uses: ./.github/actions/post-tf-comment
+        with:
+          directory: ${{ matrix.directory }}
+          kind: drift-resolved
+          label: Azure ${{ steps.azure.outputs.environment }}
+          github-token: ${{ github.token }}
+
+      - name: Open issue on drift-check error
+        if: failure() || steps.plan.outputs.exitcode == '1'
+        continue-on-error: true
+        uses: ./.github/actions/post-tf-comment
+        with:
+          directory: ${{ matrix.directory }}
+          kind: drift-error
+          label: Azure ${{ steps.azure.outputs.environment }}
+          outcome: failure
+          file-name: plan.txt
+          github-token: ${{ github.token }}
+
+      - name: Fail on drift-check error
+        if: steps.plan.outputs.exitcode == '1'
+        env:
+          DIR: ${{ matrix.directory }}
+        run: |
+          echo "::error::Drift check errored for ${DIR} (terraform plan exit 1)"
+          exit 1
+
+  # -------------------------------------------------------------------
+  # Job 4: Drift — Datadog (state in management account S3)
+  # -------------------------------------------------------------------
+  drift-datadog:
+    name: "Drift: ${{ matrix.directory }}"
+    needs: discover
+    if: needs.discover.outputs.has_datadog == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: terraform-datadog-${{ matrix.directory }}
+      cancel-in-progress: false
+    strategy:
+      matrix:
+        directory: ${{ fromJson(needs.discover.outputs.datadog_dirs) }}
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_MANAGEMENT }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Terraform Init
+        working-directory: ${{ matrix.directory }}
+        run: |
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          terraform init -input=false
+
+      - name: Terraform Plan (drift check)
+        working-directory: ${{ matrix.directory }}
+        id: plan
+        env:
+          DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+          DATADOG_APP_KEY: ${{ secrets.DATADOG_APP_KEY }}
+        run: |
+          set +e
+          terraform plan -no-color -input=false -lock=false -detailed-exitcode -out=tfplan 2>&1 | tee plan.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Classify drift
+        id: classify
+        if: steps.plan.outputs.exitcode == '2'
+        uses: ./.github/actions/tf-drift-classify
+        with:
+          directory: ${{ matrix.directory }}
+
+      - name: Open issue on drift
+        if: steps.classify.outputs.real_drift == 'true'
+        # Issue bookkeeping is a best-effort notification layer — a flaky GitHub
+        # API call must not red the read-only drift check (it retries internally
+        # and the next scheduled run is idempotent).
+        continue-on-error: true
+        uses: ./.github/actions/post-tf-comment
+        with:
+          directory: ${{ matrix.directory }}
+          kind: drift
+          label: Datadog
+          outcome: failure
+          file-name: plan.txt
+          fingerprint: ${{ steps.classify.outputs.fingerprint }}
+          github-token: ${{ github.token }}
+
+      - name: Resolve drift issue
+        if: steps.plan.outputs.exitcode != '1' && steps.classify.outputs.real_drift != 'true'
+        continue-on-error: true
+        uses: ./.github/actions/post-tf-comment
+        with:
+          directory: ${{ matrix.directory }}
+          kind: drift-resolved
+          label: Datadog
+          github-token: ${{ github.token }}
+
+      - name: Open issue on drift-check error
+        if: failure() || steps.plan.outputs.exitcode == '1'
+        continue-on-error: true
+        uses: ./.github/actions/post-tf-comment
+        with:
+          directory: ${{ matrix.directory }}
+          kind: drift-error
+          label: Datadog
+          outcome: failure
+          file-name: plan.txt
+          github-token: ${{ github.token }}
+
+      - name: Fail on drift-check error
+        if: steps.plan.outputs.exitcode == '1'
+        env:
+          DIR: ${{ matrix.directory }}
+        run: |
+          echo "::error::Drift check errored for ${DIR} (terraform plan exit 1)"
+          exit 1

@@ -1,0 +1,43 @@
+{
+  "tags": {
+    "Product": {
+      "tag_key": {
+        "@@assign": "Product"
+      },
+      "tag_value": {
+        "@@assign": [
+          "shared",
+          "example-app"
+        ]
+      }
+    },
+    "Tier": {
+      "tag_key": {
+        "@@assign": "Tier"
+      },
+      "tag_value": {
+        "@@assign": [
+          "foundation",
+          "platform",
+          "workloads",
+          "governance",
+          "organization",
+          "bootstrap"
+        ]
+      }
+    },
+    "Environment": {
+      "tag_key": {
+        "@@assign": "Environment"
+      },
+      "tag_value": {
+        "@@assign": [
+          "production",
+          "staging",
+          "sandbox",
+          "management"
+        ]
+      }
+    }
+  }
+}

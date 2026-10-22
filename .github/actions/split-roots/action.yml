@@ -1,0 +1,94 @@
+name: Split roots by cloud
+description: >-
+  Split the JSON list of Terraform roots from scripts/detect-changes.sh into
+  per-cloud lists (each cloud authenticates differently), dropping the roots of
+  any cloud whose CI is not enabled yet. A fresh clone of the template has no
+  cloud credentials, so its PR checks stay green with plans skipped until the
+  CI_<CLOUD>_ENABLED repository variables are set to "true" (SETUP.md).
+
+inputs:
+  dirs:
+    description: JSON array of Terraform root directories.
+    required: true
+  aws-enabled:
+    description: '"true" to plan AWS roots (vars.CI_AWS_ENABLED).'
+    required: false
+    default: ""
+  azure-enabled:
+    description: '"true" to plan Azure roots (vars.CI_AZURE_ENABLED).'
+    required: false
+    default: ""
+  datadog-enabled:
+    description: '"true" to plan Datadog roots (vars.CI_DATADOG_ENABLED).'
+    required: false
+    default: ""
+
+outputs:
+  aws_dirs:
+    description: JSON array of AWS roots to run.
+    value: ${{ steps.split.outputs.aws_dirs }}
+  azure_dirs:
+    description: JSON array of Azure roots to run.
+    value: ${{ steps.split.outputs.azure_dirs }}
+  datadog_dirs:
+    description: JSON array of Datadog roots to run.
+    value: ${{ steps.split.outputs.datadog_dirs }}
+  has_aws:
+    description: '"true" when aws_dirs is non-empty.'
+    value: ${{ steps.split.outputs.has_aws }}
+  has_azure:
+    description: '"true" when azure_dirs is non-empty.'
+    value: ${{ steps.split.outputs.has_azure }}
+  has_datadog:
+    description: '"true" when datadog_dirs is non-empty.'
+    value: ${{ steps.split.outputs.has_datadog }}
+  disabled_dirs:
+    description: JSON array of roots dropped because their cloud's CI is not enabled.
+    value: ${{ steps.split.outputs.disabled_dirs }}
+
+runs:
+  using: composite
+  steps:
+    - name: Split roots
+      id: split
+      shell: bash
+      env:
+        DIRS: ${{ inputs.dirs }}
+        AWS_ENABLED: ${{ inputs.aws-enabled }}
+        AZURE_ENABLED: ${{ inputs.azure-enabled }}
+        DATADOG_ENABLED: ${{ inputs.datadog-enabled }}
+      run: |
+        set -euo pipefail
+        pick() { jq -c --arg p "$1" '[.[] | select(startswith($p))]' <<< "$DIRS"; }
+
+        disabled='[]'
+        for cloud in aws azure datadog; do
+          case "$cloud" in
+            aws) enabled="$AWS_ENABLED"; flag=CI_AWS_ENABLED ;;
+            azure) enabled="$AZURE_ENABLED"; flag=CI_AZURE_ENABLED ;;
+            datadog) enabled="$DATADOG_ENABLED"; flag=CI_DATADOG_ENABLED ;;
+          esac
+          dirs=$(pick "${cloud}/")
+          if [[ "$enabled" != "true" && "$dirs" != "[]" ]]; then
+            echo "::warning::Skipping ${cloud} roots: repository variable ${flag} is not \"true\". See SETUP.md."
+            disabled=$(jq -nc --argjson a "$disabled" --argjson b "$dirs" '$a + $b')
+            dirs='[]'
+          fi
+          has=false
+          if [[ "$dirs" != "[]" ]]; then has=true; fi
+          {
+            echo "${cloud}_dirs=${dirs}"
+            echo "has_${cloud}=${has}"
+          } >> "$GITHUB_OUTPUT"
+        done
+        echo "disabled_dirs=${disabled}" >> "$GITHUB_OUTPUT"
+
+        {
+          echo "### Terraform roots"
+          jq -r '.[] | "- `\(.)`"' <<< "$DIRS"
+          if [[ "$disabled" != "[]" ]]; then
+            echo
+            echo "**Skipped (cloud CI not enabled):**"
+            jq -r '.[] | "- `\(.)`"' <<< "$disabled"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"

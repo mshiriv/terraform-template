@@ -1,0 +1,59 @@
+name: Configure private module access
+description: >-
+  Mint a short-lived GitHub App token scoped to your private Terraform module
+  repo(s) and rewrite their git URLs so `terraform init` can fetch git::
+  module sources. No-op until the App secrets are configured (gated on app-id
+  being non-empty), so roots that only use public registry modules need no
+  setup. The token is passed via env, never inlined.
+
+inputs:
+  app-id:
+    description: GitHub App ID (TF_MODULES_APP_ID secret). Empty disables the action.
+    required: false
+    default: ""
+  private-key:
+    description: GitHub App private key, PEM (TF_MODULES_APP_PRIVATE_KEY secret).
+    required: false
+    default: ""
+  owner:
+    description: Owner of the module repositories. Empty = this repository's owner.
+    required: false
+    default: ""
+  repositories:
+    description: Comma-separated module repository names the token may read.
+    required: false
+    default: terraform-modules
+
+runs:
+  using: composite
+  steps:
+    - name: Mint module read token
+      id: modtoken
+      if: ${{ inputs.app-id != '' }}
+      uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      env:
+        FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.private-key }}
+        owner: ${{ inputs.owner || github.repository_owner }}
+        repositories: ${{ inputs.repositories }}
+
+    # Sources must use the form git::https://github.com/<owner>/<repo>.git//<path>?ref=<tag>
+    # for the rewrite below to match.
+    - name: Configure git auth for private modules
+      if: ${{ steps.modtoken.outputs.token != '' }}
+      shell: bash
+      env:
+        MOD_TOKEN: ${{ steps.modtoken.outputs.token }}
+        OWNER: ${{ inputs.owner || github.repository_owner }}
+        REPOS: ${{ inputs.repositories }}
+      run: |
+        IFS=',' read -ra repos <<< "$REPOS"
+        for repo in "${repos[@]}"; do
+          repo="${repo// /}"
+          [[ -n "$repo" ]] || continue
+          git config --global \
+            url."https://x-access-token:${MOD_TOKEN}@github.com/${OWNER}/${repo}.git".insteadOf \
+            "https://github.com/${OWNER}/${repo}.git"
+        done

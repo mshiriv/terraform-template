@@ -1,0 +1,63 @@
+name: Install pre-commit tooling
+description: >-
+  Install the pinned, integrity-checked tools the pre-commit hooks invoke:
+  pre-commit + checkov (pip, exact pins), tflint and trivy (official SHA-pinned
+  setup actions), and terraform-docs (checksum-verified download). No
+  unverified `curl | sh` installs.
+
+inputs:
+  tflint-version:
+    description: tflint version to install.
+    required: false
+    default: v0.64.0
+  trivy-version:
+    description: trivy version to install (with leading v).
+    required: false
+    default: v0.76.0
+  terraform-docs-version:
+    description: terraform-docs version to install.
+    required: false
+    default: v0.24.0
+  terraform-docs-sha256:
+    description: SHA256 of the terraform-docs linux-amd64 tarball for the pinned version.
+    required: false
+    default: 9005daf969de0b50134493a2c00078b49f5f5b39d021cda7c89bf4d4f3d776d3
+
+runs:
+  using: composite
+  steps:
+    - name: Install pinned pre-commit + checkov (pip)
+      shell: bash
+      run: |
+        # Versions are pinned in .github/requirements-precommit.txt (single source
+        # of truth, also used by setup-python's pip cache key).
+        python -m pip install --upgrade -r "${GITHUB_WORKSPACE}/.github/requirements-precommit.txt"
+
+    - name: Install tflint
+      uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+      env:
+        FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      with:
+        tflint_version: ${{ inputs.tflint-version }}
+
+    - name: Install trivy
+      uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+      env:
+        FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      with:
+        version: ${{ inputs.trivy-version }}
+        cache: true
+
+    - name: Install terraform-docs (checksum-verified)
+      shell: bash
+      env:
+        TD_VERSION: ${{ inputs.terraform-docs-version }}
+        TD_SHA256: ${{ inputs.terraform-docs-sha256 }}
+      run: |
+        set -euo pipefail
+        url="https://github.com/terraform-docs/terraform-docs/releases/download/${TD_VERSION}/terraform-docs-${TD_VERSION}-linux-amd64.tar.gz"
+        curl -sSLo terraform-docs.tar.gz "$url"
+        echo "${TD_SHA256}  terraform-docs.tar.gz" | sha256sum -c -
+        tar -xzf terraform-docs.tar.gz -C /usr/local/bin terraform-docs
+        rm -f terraform-docs.tar.gz
+        terraform-docs --version

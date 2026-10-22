@@ -1,0 +1,196 @@
+name: Post Terraform output
+description: >-
+  Post a Terraform plan/apply result as a PR comment, or open/update/close a
+  drift issue. Reads the captured output file via an input (never interpolated
+  into a shell or script body) and promotes plan markers so GitHub renders a
+  colored diff.
+
+inputs:
+  directory:
+    description: Terraform root directory (relative path).
+    required: true
+  kind:
+    description: "One of: plan | apply | drift | drift-error | drift-resolved."
+    required: true
+  label:
+    description: Human label for the environment/cloud (e.g. production, Azure, Datadog).
+    required: true
+  outcome:
+    description: Outcome of the terraform step (success | failure).
+    required: false
+    default: success
+  file-name:
+    description: Output file name within the directory (plan.txt or apply.txt).
+    required: false
+    default: plan.txt
+  fingerprint:
+    description: >-
+      drift only: hash of the pending changes (from tf-drift-classify). An open
+      issue whose stored fingerprint matches is refreshed silently instead of
+      getting another notifying comment. Empty = always notify. drift-error
+      derives its own from the error lines.
+    required: false
+    default: ""
+  github-token:
+    description: Token used to create the PR comment / drift issue.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Post Terraform output
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        # github-script is a JS action; match the repo-wide Node 24 runtime shim
+        # (composite steps do not reliably inherit the workflow-level value).
+        FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+        TF_DIRECTORY: ${{ inputs.directory }}
+        TF_KIND: ${{ inputs.kind }}
+        TF_LABEL: ${{ inputs.label }}
+        TF_OUTCOME: ${{ inputs.outcome }}
+        TF_FILE_NAME: ${{ inputs.file-name }}
+        TF_FINGERPRINT: ${{ inputs.fingerprint }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require('fs');
+          const dir = process.env.TF_DIRECTORY;
+          const kind = process.env.TF_KIND;
+          const label = process.env.TF_LABEL;
+          const outcome = process.env.TF_OUTCOME;
+          const fileName = process.env.TF_FILE_NAME;
+          // GitHub comment/issue body cap is 65536 chars; keep the tail with headroom.
+          const COMMENT_MAX_BYTES = 60000;
+          // drift-resolved only closes an issue — it never renders plan output, so
+          // skip the file read entirely for it.
+          let out = '';
+          if (kind !== 'drift-resolved') {
+            try {
+              // Promote terraform plan markers (+, -, ~, -/+) to column 1 so GitHub's
+              // `diff` code fence colors adds green and removes red (~ stays neutral —
+              // GitHub Markdown has no native blue for updates).
+              out = fs.readFileSync(`${dir}/${fileName}`, 'utf8').slice(-COMMENT_MAX_BYTES)
+                .replace(/^( +)(-\/\+|[+\-~]) /gm, '$2 $1');
+            } catch (e) {
+              out = `(no ${fileName} produced: ${e.message})`;
+            }
+          }
+          const status = outcome === 'success' ? '✅' : '❌';
+
+          // GitHub's issues API returns sporadic 401/403/429/5xx under the
+          // parallel drift matrix (dozens of jobs writing at once). Retry
+          // transient failures with backoff so a flaky call doesn't drop a
+          // drift notification or red the run.
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          async function withRetry(fn, what) {
+            const RETRYABLE = new Set([401, 403, 429, 500, 502, 503, 504]);
+            for (let attempt = 1; ; attempt++) {
+              try {
+                return await fn();
+              } catch (e) {
+                if (!RETRYABLE.has(e.status) || attempt >= 4) throw e;
+                const delay = 1000 * 2 ** (attempt - 1); // 1s, 2s, 4s
+                core.warning(`${what} failed (HTTP ${e.status}); retry ${attempt}/3 in ${delay}ms`);
+                await sleep(delay);
+              }
+            }
+          }
+
+          if (kind === 'drift' || kind === 'drift-error' || kind === 'drift-resolved') {
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const now = new Date().toISOString();
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const titles = {
+              drift: `Drift detected: ${dir}`,
+              'drift-error': `Drift check failing: ${dir}`,
+            };
+            // One issue per root and kind: find any already-open issue for this
+            // dir so a persistent drift updates that issue instead of filing a
+            // new one on every scheduled run.
+            const open = await withRetry(() => github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', labels: 'drift', per_page: 100,
+            }), 'list drift issues');
+            const matching = (k) => open.filter(i => i.title === titles[k]);
+
+            const closeAll = async (issues, message) => {
+              for (const issue of issues) {
+                await withRetry(() => github.rest.issues.createComment({
+                  owner, repo, issue_number: issue.number, body: message,
+                }), `comment on #${issue.number}`);
+                await withRetry(() => github.rest.issues.update({
+                  owner, repo, issue_number: issue.number,
+                  state: 'closed', state_reason: 'completed',
+                }), `close #${issue.number}`);
+              }
+            };
+
+            // Any plan that completed proves the check itself works again.
+            if (kind !== 'drift-error') {
+              await closeAll(matching('drift-error'),
+                `✅ Drift check for \`${dir}\` ran successfully at ${now} ([run](${runUrl})). Closing automatically.`);
+            }
+            if (kind === 'drift-resolved') {
+              // The root is clean (or only benign output-/refresh-only diff): close
+              // any lingering drift issue so resolved/false-positive ones don't pile up.
+              await closeAll(matching('drift'),
+                `✅ Drift cleared: \`${dir}\` matches configuration as of ${now}. Closing automatically.`);
+              return;
+            }
+
+            // A fresh full-plan comment for unchanged drift on every scheduled run
+            // trains everyone to ignore the issue. Instead the issue body always
+            // holds the latest output (an edit, which notifies nobody), and a
+            // comment, which does notify, is only added when the fingerprint
+            // changes.
+            let fingerprint = process.env.TF_FINGERPRINT;
+            if (kind === 'drift-error') {
+              // Error text carries request IDs, lock IDs and timestamps; mask
+              // them so the same failure hashes the same on every run.
+              const errors = [...new Set((out.match(/^Error: .*$/gm) || [])
+                .map(l => l.replace(/[0-9a-f]{8,}(-[0-9a-f]{4,})*/gi, '#').replace(/\d+/g, '#')))].sort();
+              fingerprint = require('crypto').createHash('sha256')
+                .update(errors.join('\n') || out.split('\n')[0]).digest('hex').slice(0, 16);
+            }
+            const marker = fingerprint ? `\n\n<!-- tf-fingerprint: ${fingerprint} -->` : '';
+
+            const intro = kind === 'drift'
+              ? '## Drift detected'
+              : '## Drift check failing\n\nThe scheduled `terraform plan` for this root did not complete (auth, init or plan error), so drift is **not** being checked. This issue closes automatically after the next successful check.';
+            const outro = kind === 'drift'
+              ? '\n\nPlease investigate and either:\n- Apply the Terraform config to fix drift\n- Import the manual change into Terraform'
+              : '';
+            const body = `${intro}\n\n**Directory:** \`${dir}\`\n**Environment:** ${label}\n**Last checked:** ${now} ([run](${runUrl}))\n\n<details><summary>${kind === 'drift' ? 'Plan output' : 'Output'}</summary>\n\n\`\`\`diff\n${out}\n\`\`\`\n</details>${outro}${marker}`;
+
+            const existing = matching(kind)[0];
+            if (!existing) {
+              await withRetry(() => github.rest.issues.create({
+                owner, repo, title: titles[kind], body, labels: ['drift', 'infrastructure'],
+              }), `open ${kind} issue`);
+              return;
+            }
+            const previous = (existing.body || '').match(/<!-- tf-fingerprint: (\w+) -->/)?.[1];
+            await withRetry(() => github.rest.issues.update({
+              owner, repo, issue_number: existing.number, body,
+            }), `refresh #${existing.number}`);
+            if (fingerprint && previous === fingerprint) {
+              core.info(`#${existing.number} unchanged (fingerprint ${fingerprint}); refreshed the body without notifying.`);
+              return;
+            }
+            await withRetry(() => github.rest.issues.createComment({
+              owner, repo, issue_number: existing.number,
+              body: body.replace(/^## (Drift detected|Drift check failing)/, '## $1 (changed)'),
+            }), `comment on #${existing.number}`);
+            return;
+          }
+
+          const verb = kind === 'apply' ? 'Apply' : 'Plan';
+          const warning = (kind === 'apply' && outcome === 'success')
+            ? '\n\n> ⚠️ **Apply succeeded. This PR MUST be merged to keep code and state in sync.**'
+            : '';
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            body: `### ${status} ${verb}: \`${dir}\` (${label})${warning}\n\n<details><summary>Show output</summary>\n\n\`\`\`diff\n${out}\n\`\`\`\n</details>`,
+          });

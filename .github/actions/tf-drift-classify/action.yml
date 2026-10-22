@@ -1,0 +1,77 @@
+name: Classify Terraform drift
+description: >-
+  Decide whether a saved Terraform plan (tfplan) represents *actionable* drift.
+  `terraform plan -detailed-exitcode` returns 2 for ANY non-empty plan, which
+  includes benign diffs that change no real infrastructure: output-only writes
+  (a new/changed `output` value persisted to state) and refresh-only state syncs
+  (the provider returned a server-normalized attribute, reported as drift but
+  matching configuration). This inspects the JSON plan and reports drift only
+  when a managed resource has a pending create / update / delete / replace.
+
+inputs:
+  directory:
+    description: Terraform root directory holding the saved `tfplan` (and its `.terraform`).
+    required: true
+
+outputs:
+  real_drift:
+    description: "'true' when the plan contains an actionable resource change, else 'false'."
+    value: ${{ steps.classify.outputs.real_drift }}
+  fingerprint:
+    description: >-
+      Short hash of the actionable changes (resource address + actions). Stable
+      across runs while the drift is unchanged, so the drift issue is only
+      re-notified when the set of pending changes actually moves.
+    value: ${{ steps.classify.outputs.fingerprint }}
+
+runs:
+  using: composite
+  steps:
+    - id: classify
+      shell: bash
+      env:
+        TF_DIRECTORY: ${{ inputs.directory }}
+      run: |
+        # No `set -e`: a classify hiccup must never silently swallow drift. On any
+        # failure to read/parse the plan we fail SAFE — report drift so a human
+        # looks — and always exit 0, so the workflow's open/close logic is driven
+        # purely by real_drift (never by this step's success/failure).
+        set -uo pipefail
+
+        # Empty fingerprint = "unknown": the issue is always re-notified.
+        json=$(terraform -chdir="$TF_DIRECTORY" show -json tfplan 2>/dev/null) || json=""
+        if [ -z "$json" ]; then
+          echo "::warning::Could not read plan JSON for ${TF_DIRECTORY}; treating as drift (fail-safe)."
+          echo "real_drift=true" >> "$GITHUB_OUTPUT"
+          echo "fingerprint=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # A "no-op" resource is unchanged; a "read" is a (deferred) data-source
+        # lookup. Neither touches real infrastructure. Any other action
+        # (create/update/delete, or a create+delete replacement) is real drift.
+        # output_changes and the top-level resource_drift block are intentionally
+        # ignored — they are exactly the false positives this guard removes.
+        actionable='[.resource_changes[]?
+                 | select((.change.actions // []) != ["no-op"]
+                      and (.change.actions // []) != ["read"])]'
+        count=$(printf '%s' "$json" | jq "$actionable | length" 2>/dev/null) || count=""
+        if [ -z "$count" ]; then
+          echo "::warning::Could not parse plan JSON for ${TF_DIRECTORY}; treating as drift (fail-safe)."
+          echo "real_drift=true" >> "$GITHUB_OUTPUT"
+          echo "fingerprint=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        fingerprint=$(printf '%s' "$json" \
+          | jq -r "$actionable"' | map("\(.address) \(.change.actions | join("+"))") | sort | join("\n")' \
+          | sha256sum | cut -c1-16)
+        echo "fingerprint=${fingerprint}" >> "$GITHUB_OUTPUT"
+
+        if [ "$count" -gt 0 ]; then
+          echo "real_drift=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::Actionable drift in ${TF_DIRECTORY}: ${count} resource change(s)."
+        else
+          echo "real_drift=false" >> "$GITHUB_OUTPUT"
+          echo "Plan is non-empty but changes no real infrastructure (output-only / refresh-only) — not drift."
+        fi

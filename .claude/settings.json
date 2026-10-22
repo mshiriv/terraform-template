@@ -1,0 +1,51 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(terraform fmt:*)",
+      "Bash(terraform validate:*)",
+      "Bash(terraform plan:*)",
+      "Bash(terraform providers:*)",
+      "Bash(terraform version:*)",
+      "Bash(terraform state list:*)",
+      "Bash(terraform state show:*)",
+      "Bash(tflint:*)",
+      "Bash(terraform-docs:*)",
+      "Bash(pre-commit run:*)",
+      "Bash(scripts/new-root.sh:*)",
+      "Bash(scripts/detect-changes.sh:*)",
+      "Bash(scripts/check-required-tags.sh:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)"
+    ],
+    "deny": [
+      "Bash(terraform apply:*)",
+      "Bash(terraform destroy:*)",
+      "Bash(terraform import:*)",
+      "Bash(terraform taint:*)",
+      "Bash(terraform untaint:*)",
+      "Bash(terraform force-unlock:*)",
+      "Bash(terraform state rm:*)",
+      "Bash(terraform state mv:*)",
+      "Bash(terraform state push:*)",
+      "Bash(terraform state replace-provider:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|MultiEdit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/terraform-fmt.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

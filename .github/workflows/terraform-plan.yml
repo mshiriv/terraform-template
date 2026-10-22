@@ -1,0 +1,553 @@
+name: Terraform Plan
+
+on:
+  pull_request:
+    paths:
+      - 'aws/**'
+      - 'azure/**'
+      - 'datadog/**'
+      - 'github/**'
+      - 'scripts/**'
+      - '.github/actions/**'
+      # Any workflow edit (e.g. the chatops apply gate) must also satisfy the
+      # required checks, or the PR is BLOCKED forever: same reason as docs below.
+      - '.github/workflows/**'
+      # Guardrail configs: editing a suppression/lint/docs rule still runs the
+      # pre-commit gate + the required plan-summary check.
+      - '.pre-commit-config.yaml'
+      - '.tflint.hcl'
+      - '.terraform-docs.yml'
+      - '.trivyignore'
+      - '.github/requirements-precommit.txt'
+      - '.claude/**'
+      # Docs-only PRs must still satisfy the required "Pre-commit Checks" and
+      # "plan-summary" status checks. Without these globs the workflow never
+      # triggers on a docs-only diff, the required checks never report, and
+      # branch protection holds the PR at "Expected: waiting for status"
+      # forever. detect-changes finds no roots, so plan-summary reports OK.
+      - '*.md'
+      - '**/*.md'
+
+concurrency:
+  # Namespace must stay distinct from terraform-chatops.yml's apply group:
+  # groups are repository-wide, so a shared name plus the cancel-in-progress
+  # below would cancel an in-flight `terraform apply` whenever someone pushes to
+  # the PR. Superseding a stale plan is safe; killing a half-applied root and
+  # stranding its state lock is not.
+  group: terraform-plan-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Keep in sync with .terraform-version.
+  TF_VERSION: "1.16.6"
+  # tflint/trivy/terraform-docs versions are pinned once, as the input defaults
+  # of .github/actions/install-precommit-tools. Don't override them here.
+  TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.tf-plugin-cache
+  # .terraform.lock.hcl is gitignored (CLAUDE.md known gap), so each `init`
+  # writes a fresh lock; with the shared plugin cache that makes init reject the
+  # cached provider as "not matching any of the checksums recorded in the
+  # dependency lock file". This opt-in lets the cache populate the lock.
+  TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE: "1"
+
+jobs:
+  # -------------------------------------------------------------------
+  # Job 1: Pre-commit checks (same hooks as local pre-commit)
+  # -------------------------------------------------------------------
+  pre-commit:
+    name: Pre-commit Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: .github/requirements-precommit.txt
+
+      - name: Install pre-commit tooling
+        uses: ./.github/actions/install-precommit-tools
+
+      # terraform_validate runs `terraform init`, which fetches git:: modules from
+      # your private modules repo, if any. No-op until the App secrets are set.
+      - name: Configure private module access
+        uses: ./.github/actions/tf-modules-token
+        with:
+          app-id: ${{ secrets.TF_MODULES_APP_ID }}
+          private-key: ${{ secrets.TF_MODULES_APP_PRIVATE_KEY }}
+          owner: ${{ vars.TF_MODULES_OWNER }}
+          repositories: ${{ vars.TF_MODULES_REPOS || 'terraform-modules' }}
+
+      - name: Cache pre-commit hook environments
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: |
+            pre-commit-
+
+      # The validate hook runs `terraform init` per changed root with the
+      # provider plugin cache disabled (see the run step). A PR that touches many
+      # roots installs the ~700 MB AWS provider once per root and can exhaust
+      # the runner's free disk ("no space left on device"). Reclaim ~25 GB of
+      # preinstalled SDKs we never use so estate-wide changes can validate.
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost 2>/dev/null || true
+          df -h /
+
+      # The terraform_tflint hook runs `tflint --init`, which downloads the
+      # rulesets pinned in .tflint.hcl. Cache them so a green run costs zero
+      # GitHub API calls. Keyed on the plugin pins and the tflint pin, so a bump
+      # to either re-downloads rather than serving a stale ruleset.
+      - name: Cache tflint plugins
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.tflint.d/plugins
+          key: tflint-${{ hashFiles('.tflint.hcl', '.github/actions/install-precommit-tools/action.yml') }}
+
+      - name: Run pre-commit on changed files
+        env:
+          # `tflint --init` verifies each ruleset against the GitHub API.
+          # Unauthenticated that is 60 requests/hour per runner IP, and on
+          # exhaustion tflint panics instead of failing cleanly, so a rate limit
+          # reads as a hard "terraform_tflint ... Failed". A token lifts the
+          # limit to 5000/h; contents: read is all it needs.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          # Disable the shared provider plugin cache for THIS job: it validates
+          # many roots in one job with gitignored lockfiles, and a shared cache
+          # makes `terraform init` reject cached providers on checksum mismatch.
+          # The plan/drift jobs keep the cache (one root per job, no clash).
+          unset TF_PLUGIN_CACHE_DIR
+          pre-commit run --from-ref "origin/${BASE_REF}" --to-ref "${HEAD_SHA}" --show-diff-on-failure
+
+  # -------------------------------------------------------------------
+  # Job 2: Required-tags gate
+  # -------------------------------------------------------------------
+  # Fails the build when any AWS provider default_tags block is missing a
+  # mandatory taxonomy key. tflint/checkov can't see default_tags, so this
+  # validates the source directly, across ALL roots (pre-commit only runs it
+  # when a providers.tf changed). See aws/README.md#tags.
+  required-tags:
+    name: Required Tags
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check required tags on every AWS provider default_tags
+        run: ./scripts/check-required-tags.sh
+
+  # -------------------------------------------------------------------
+  # Job 3: Detect which Terraform roots changed
+  # -------------------------------------------------------------------
+  detect-changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      aws_dirs: ${{ steps.split.outputs.aws_dirs }}
+      azure_dirs: ${{ steps.split.outputs.azure_dirs }}
+      datadog_dirs: ${{ steps.split.outputs.datadog_dirs }}
+      has_aws: ${{ steps.split.outputs.has_aws }}
+      has_azure: ${{ steps.split.outputs.has_azure }}
+      has_datadog: ${{ steps.split.outputs.has_datadog }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect changed Terraform directories
+        id: changes
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        # Assign first: inside `echo "...$(...)"` a non-zero exit (e.g. the
+        # removed-root guardrail) would be swallowed.
+        run: |
+          dirs=$(scripts/detect-changes.sh "$BASE_REF")
+          echo "dirs=$dirs" >> "$GITHUB_OUTPUT"
+
+      # Each cloud authenticates differently, so each gets its own matrix job.
+      # Clouds whose CI_<CLOUD>_ENABLED variable isn't "true" are skipped (with
+      # a warning) instead of failing on missing credentials.
+      - name: Split by cloud
+        id: split
+        uses: ./.github/actions/split-roots
+        with:
+          dirs: ${{ steps.changes.outputs.dirs }}
+          aws-enabled: ${{ vars.CI_AWS_ENABLED }}
+          azure-enabled: ${{ vars.CI_AZURE_ENABLED }}
+          datadog-enabled: ${{ vars.CI_DATADOG_ENABLED }}
+
+  # -------------------------------------------------------------------
+  # Job 4: Security scan (SARIF -> Security tab). Informational; the gate is
+  # the pre-commit job. Reports ALL findings (no skip list) for triage.
+  # -------------------------------------------------------------------
+  security-scan:
+    name: Security Scan (SARIF)
+    needs: detect-changes
+    if: >-
+      needs.detect-changes.outputs.has_aws == 'true' ||
+      needs.detect-changes.outputs.has_azure == 'true' ||
+      needs.detect-changes.outputs.has_datadog == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: .github/requirements-precommit.txt
+
+      - name: Install scanners
+        uses: ./.github/actions/install-precommit-tools
+
+      - name: Run checkov (SARIF)
+        continue-on-error: true
+        run: |
+          mkdir -p sarif
+          checkov -d . --framework terraform --compact --quiet \
+            --output sarif --output-file-path sarif || true
+
+      - name: Run trivy config (SARIF)
+        continue-on-error: true
+        run: |
+          mkdir -p sarif
+          trivy config --format sarif --output sarif/trivy.sarif \
+            --severity HIGH,CRITICAL --skip-dirs '**/examples' . || true
+
+      # Code scanning upload needs GitHub Advanced Security on private repos;
+      # without it this step fails, which continue-on-error tolerates.
+      - name: Upload SARIF to code scanning
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: sarif
+
+  # -------------------------------------------------------------------
+  # Job 5: Terraform Plan, AWS roots
+  # Plans run alongside pre-commit rather than after it: the plan comment lands
+  # minutes sooner, and a lint/docs failure doesn't hide the plan. Pre-commit
+  # still gates merge and apply through plan-summary.
+  # -------------------------------------------------------------------
+  plan-aws:
+    name: "Plan: ${{ matrix.directory }}"
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_aws == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        directory: ${{ fromJson(needs.detect-changes.outputs.aws_dirs) }}
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Resolve AWS role
+        id: account
+        uses: ./.github/actions/resolve-aws-role
+        with:
+          directory: ${{ matrix.directory }}
+          role-production: ${{ secrets.AWS_ROLE_PRODUCTION }}
+          role-staging: ${{ secrets.AWS_ROLE_STAGING }}
+          role-sandbox: ${{ secrets.AWS_ROLE_SANDBOX }}
+          role-management: ${{ secrets.AWS_ROLE_MANAGEMENT }}
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.account.outputs.role-arn }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Configure private module access
+        uses: ./.github/actions/tf-modules-token
+        with:
+          app-id: ${{ secrets.TF_MODULES_APP_ID }}
+          private-key: ${{ secrets.TF_MODULES_APP_PRIVATE_KEY }}
+          owner: ${{ vars.TF_MODULES_OWNER }}
+          repositories: ${{ vars.TF_MODULES_REPOS || 'terraform-modules' }}
+
+      # Exact key per root, no restore-keys fallback: a prefix fallback restores
+      # the newest cache of ANY root, init adds this root's providers, and the
+      # save archives the union, so the cache only ever grows until saving it
+      # runs the runner out of disk. Keyed on providers.tf so a root's cache
+      # survives unrelated .tf edits.
+      - name: Cache provider plugins
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: tf-plugins-v2-${{ runner.os }}-${{ hashFiles(format('{0}/providers.tf', matrix.directory)) }}
+
+      - name: Terraform Init
+        working-directory: ${{ matrix.directory }}
+        run: |
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          terraform init -input=false
+
+      # -lock-timeout: two PRs touching the same root, or a PR push during a
+      # chatops apply, contend for the root's state lock. Wait for it rather
+      # than fail the plan (and plan-summary) with "Error acquiring the state lock".
+      - name: Terraform Plan
+        working-directory: ${{ matrix.directory }}
+        id: plan
+        run: |
+          set -o pipefail
+          terraform plan -no-color -input=false -lock-timeout=10m -out=tfplan 2>&1 | tee plan.txt
+        continue-on-error: true
+
+      - name: Post plan to PR
+        # Informational only: a rate-limited/failed comment must not fail an
+        # otherwise-green plan job. The plan result is enforced by the next step.
+        continue-on-error: true
+        uses: ./.github/actions/post-tf-comment
+        with:
+          directory: ${{ matrix.directory }}
+          kind: plan
+          label: ${{ steps.account.outputs.env }}
+          outcome: ${{ steps.plan.outcome }}
+          file-name: plan.txt
+          github-token: ${{ github.token }}
+
+      - name: Fail if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  # -------------------------------------------------------------------
+  # Job 6: Terraform Plan, Azure roots
+  # -------------------------------------------------------------------
+  plan-azure:
+    name: "Plan: ${{ matrix.directory }}"
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_azure == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        directory: ${{ fromJson(needs.detect-changes.outputs.azure_dirs) }}
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Resolve Azure subscription
+        id: azure
+        uses: ./.github/actions/resolve-azure-subscription
+        with:
+          directory: ${{ matrix.directory }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-production: ${{ secrets.AZURE_SUBSCRIPTION_PRODUCTION }}
+          subscription-staging: ${{ secrets.AZURE_SUBSCRIPTION_STAGING }}
+
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ steps.azure.outputs.client-id }}
+          tenant-id: ${{ steps.azure.outputs.tenant-id }}
+          subscription-id: ${{ steps.azure.outputs.subscription-id }}
+
+      - name: Configure private module access
+        uses: ./.github/actions/tf-modules-token
+        with:
+          app-id: ${{ secrets.TF_MODULES_APP_ID }}
+          private-key: ${{ secrets.TF_MODULES_APP_PRIVATE_KEY }}
+          owner: ${{ vars.TF_MODULES_OWNER }}
+          repositories: ${{ vars.TF_MODULES_REPOS || 'terraform-modules' }}
+
+      - name: Cache provider plugins
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: tf-plugins-v2-${{ runner.os }}-${{ hashFiles(format('{0}/providers.tf', matrix.directory)) }}
+
+      - name: Terraform Init
+        working-directory: ${{ matrix.directory }}
+        run: |
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          terraform init -input=false
+
+      - name: Terraform Plan
+        working-directory: ${{ matrix.directory }}
+        id: plan
+        run: |
+          set -o pipefail
+          terraform plan -no-color -input=false -lock-timeout=10m -out=tfplan 2>&1 | tee plan.txt
+        continue-on-error: true
+
+      - name: Post plan to PR
+        continue-on-error: true
+        uses: ./.github/actions/post-tf-comment
+        with:
+          directory: ${{ matrix.directory }}
+          kind: plan
+          label: Azure ${{ steps.azure.outputs.environment }}
+          outcome: ${{ steps.plan.outcome }}
+          file-name: plan.txt
+          github-token: ${{ github.token }}
+
+      - name: Fail if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  # -------------------------------------------------------------------
+  # Job 7: Terraform Plan, Datadog roots (state in the management account)
+  # -------------------------------------------------------------------
+  plan-datadog:
+    name: "Plan: ${{ matrix.directory }}"
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_datadog == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        directory: ${{ fromJson(needs.detect-changes.outputs.datadog_dirs) }}
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_MANAGEMENT }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Cache provider plugins
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: tf-plugins-v2-${{ runner.os }}-${{ hashFiles(format('{0}/providers.tf', matrix.directory)) }}
+
+      - name: Terraform Init
+        working-directory: ${{ matrix.directory }}
+        run: |
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          terraform init -input=false
+
+      - name: Terraform Plan
+        working-directory: ${{ matrix.directory }}
+        id: plan
+        env:
+          DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+          DATADOG_APP_KEY: ${{ secrets.DATADOG_APP_KEY }}
+        run: |
+          set -o pipefail
+          terraform plan -no-color -input=false -lock-timeout=10m -out=tfplan 2>&1 | tee plan.txt
+        continue-on-error: true
+
+      - name: Post plan to PR
+        continue-on-error: true
+        uses: ./.github/actions/post-tf-comment
+        with:
+          directory: ${{ matrix.directory }}
+          kind: plan
+          label: Datadog
+          outcome: ${{ steps.plan.outcome }}
+          file-name: plan.txt
+          github-token: ${{ github.token }}
+
+      - name: Fail if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  # -------------------------------------------------------------------
+  # Job 8: Stable aggregate status check. Matrix leg names vary per PR, so
+  # this single job is what branch protection requires (github/repo-management).
+  # -------------------------------------------------------------------
+  plan-summary:
+    name: plan-summary
+    needs: [pre-commit, required-tags, detect-changes, plan-aws, plan-azure, plan-datadog]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Aggregate plan results
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          R_PRECOMMIT: ${{ needs.pre-commit.result }}
+          R_TAGS: ${{ needs.required-tags.result }}
+          R_DETECT: ${{ needs.detect-changes.result }}
+          R_AWS: ${{ needs.plan-aws.result }}
+          R_AZURE: ${{ needs.plan-azure.result }}
+          R_DATADOG: ${{ needs.plan-datadog.result }}
+          HAS_AWS: ${{ needs.detect-changes.outputs.has_aws }}
+          HAS_AZURE: ${{ needs.detect-changes.outputs.has_azure }}
+          HAS_DATADOG: ${{ needs.detect-changes.outputs.has_datadog }}
+        with:
+          script: |
+            const r = {
+              'pre-commit': process.env.R_PRECOMMIT,
+              'required-tags': process.env.R_TAGS,
+              'detect-changes': process.env.R_DETECT,
+              'plan-aws': process.env.R_AWS,
+              'plan-azure': process.env.R_AZURE,
+              'plan-datadog': process.env.R_DATADOG,
+            };
+            core.info(`Job results: ${JSON.stringify(r)}`);
+            // Gate jobs must have succeeded outright.
+            for (const j of ['pre-commit', 'required-tags', 'detect-changes']) {
+              if (r[j] !== 'success') core.setFailed(`${j} did not succeed (${r[j]})`);
+            }
+            // A plan job that ran must not have failed/cancelled. 'skipped' = no
+            // roots for that cloud (or its CI isn't enabled), which is fine.
+            for (const j of ['plan-aws', 'plan-azure', 'plan-datadog']) {
+              if (r[j] === 'failure' || r[j] === 'cancelled') {
+                core.setFailed(`${j} ${r[j]}`);
+              }
+            }
+            // Guard against the false-green trap: detect-changes claimed roots
+            // but every plan job skipped.
+            const claimed = ['HAS_AWS', 'HAS_AZURE', 'HAS_DATADOG'].some(k => process.env[k] === 'true');
+            const ran = ['plan-aws', 'plan-azure', 'plan-datadog'].some(j => r[j] !== 'skipped');
+            if (claimed && !ran) {
+              core.setFailed('detect-changes reported roots but no plan job ran');
+            }
+            core.info('plan-summary OK');

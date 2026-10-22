@@ -1,0 +1,25 @@
+formatter: markdown table
+
+output:
+  file: README.md
+  mode: inject
+
+# Hide the "Providers" section: it renders lock-RESOLVED provider versions, which
+# differ between a fresh checkout (no lock -> constraint) and CI (init creates a
+# lock -> resolved), making terraform_docs non-deterministic and red in CI. The
+# "Requirements" section already documents the provider version constraints stably.
+sections:
+  hide:
+    - providers
+
+sort:
+  enabled: true
+  by: required
+
+settings:
+  anchor: true
+  escape: true
+  indent: 2
+  required: true
+  sensitive: true
+  type: true

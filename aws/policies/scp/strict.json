@@ -1,0 +1,68 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyRootAccountUsage",
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "aws:PrincipalArn": "arn:aws:iam::*:root"
+        }
+      }
+    },
+    {
+      "Sid": "ProtectCloudTrail",
+      "Effect": "Deny",
+      "Action": [
+        "cloudtrail:DeleteTrail",
+        "cloudtrail:StopLogging",
+        "cloudtrail:UpdateTrail",
+        "cloudtrail:PutEventSelectors"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ProtectConfig",
+      "Effect": "Deny",
+      "Action": [
+        "config:DeleteConfigurationRecorder",
+        "config:DeleteDeliveryChannel",
+        "config:DeleteRetentionConfiguration",
+        "config:StopConfigurationRecorder"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ProtectGuardDuty",
+      "Effect": "Deny",
+      "Action": [
+        "guardduty:DeleteDetector",
+        "guardduty:DisassociateFromMasterAccount",
+        "guardduty:DisassociateFromAdministratorAccount"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ProtectSecurityHub",
+      "Effect": "Deny",
+      "Action": [
+        "securityhub:DisableSecurityHub",
+        "securityhub:DisassociateFromMasterAccount",
+        "securityhub:DisassociateFromAdministratorAccount",
+        "securityhub:DeleteMembers"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyRemoveS3PublicAccessBlock",
+      "Effect": "Deny",
+      "Action": [
+        "s3:DeleteBucketPublicAccessBlock",
+        "s3:DeleteAccountPublicAccessBlock"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

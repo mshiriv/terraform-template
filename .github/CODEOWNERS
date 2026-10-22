@@ -1,0 +1,32 @@
+# CODEOWNERS
+#
+# Every change needs platform-team review. The path rules below document
+# review intent for high-blast-radius and security-sensitive roots; they are
+# enforced once the branch ruleset requires code-owner review
+# (github/repo-management, var.require_code_owner_review).
+#
+# scripts/init-template.sh replaces @YOUR_GITHUB_ORG/platform-team with the
+# owner you pass. Point the narrower paths at dedicated teams (e.g.
+# platform-leads, security) once they exist.
+
+# Default: everything.
+*                                   @YOUR_GITHUB_ORG/platform-team
+
+# High blast radius: the org itself, SCPs, production, CI, repo settings.
+/aws/organization/                  @YOUR_GITHUB_ORG/platform-team
+/aws/policies/                      @YOUR_GITHUB_ORG/platform-team
+/aws/bootstrap/                     @YOUR_GITHUB_ORG/platform-team
+/aws/accounts/management/           @YOUR_GITHUB_ORG/platform-team
+/aws/accounts/production/           @YOUR_GITHUB_ORG/platform-team
+/azure/bootstrap/                   @YOUR_GITHUB_ORG/platform-team
+/azure/production/                  @YOUR_GITHUB_ORG/platform-team
+/github/                            @YOUR_GITHUB_ORG/platform-team
+/.github/                           @YOUR_GITHUB_ORG/platform-team
+/scripts/                           @YOUR_GITHUB_ORG/platform-team
+
+# Security- and identity-sensitive roots and guardrail config.
+/aws/accounts/*/github-oidc/        @YOUR_GITHUB_ORG/platform-team
+/aws/accounts/*/hardening/          @YOUR_GITHUB_ORG/platform-team
+/.pre-commit-config.yaml            @YOUR_GITHUB_ORG/platform-team
+/.trivyignore                       @YOUR_GITHUB_ORG/platform-team
+/.claude/                           @YOUR_GITHUB_ORG/platform-team

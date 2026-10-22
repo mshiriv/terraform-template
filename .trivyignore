@@ -1,0 +1,18 @@
+# Trivy IaC findings we intentionally allow.
+#
+# Format: one check ID per line (e.g. AVD-AWS-0040). Lines starting with # are
+# comments. Every entry MUST carry a comment above it that says:
+#   - what the finding is,
+#   - why it is accepted here (design decision, compensating control),
+#   - where the decision is documented, and
+#   - the follow-up that would let you drop the entry, if any.
+#
+# Prefer an inline `#trivy:ignore:<ID>` on the one resource over a repo-wide
+# entry here: a line in this file silences the check in every root.
+#
+# Example:
+#
+# # Internet-facing load balancer (`internal = false`). Required by design for
+# # the public ingress NLB; the listener only forwards TLS. See
+# # aws/accounts/production/eu-west-1/02-platform/nlb.tf.
+# AVD-AWS-0053

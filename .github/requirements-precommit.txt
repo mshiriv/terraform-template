@@ -1,0 +1,7 @@
+# Pinned Python tooling for the pre-commit CI gate.
+# Covered by the pip ecosystem in .github/dependabot.yml (directory "/.github"),
+# which opens weekly bump PRs.
+# TODO: regenerate with hashes (`pip-compile --generate-hashes`) and install with
+# `pip install --require-hashes` for full supply-chain integrity.
+pre-commit==4.7.0
+checkov==3.3.29
